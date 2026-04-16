@@ -7,10 +7,12 @@ import spaces
 # Functions
 def endpoint(payload: dict) -> dict: return {"received": payload, "message": "Working", "status": "ok"}
 
-@spaces.GPU(size="large", duration=1)
-def ping():
+def ping() -> bool:
+    @spaces.GPU(size="large", duration=1)
+    def _(): return None
+    
     print(f"SERVER | Space has been pinged. ☁️")
-    return
+    return True
 
 # Initialize
 with gradio.Blocks() as demo:
