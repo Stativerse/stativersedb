@@ -13,8 +13,8 @@ def ping():
     return
 
 # Initialize
-with gradio.Blocks() as api:
+with gradio.Blocks() as demo:
     gradio.api(endpoint, api_name="endpoint")
     gradio.api(ping, api_name="ping")
 
-api.queue(default_concurrency_limit=16, max_size=256).launch(ssr_mode=False)
+demo.queue(default_concurrency_limit=16, max_size=256).launch(ssr_mode=False)
