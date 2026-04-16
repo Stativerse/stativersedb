@@ -7,6 +7,19 @@ import traceback
 
 from typing import Any
 
+THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OMP_THREAD_LIMIT",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS"
+)
+
+for env_name in THREAD_ENV_VARS:
+    os.environ[env_name] = "2"
+
 import uvicorn
 
 from fastapi import Body, FastAPI
@@ -20,7 +33,10 @@ CONFIG = {
     "snapshot_db_path": os.path.join("/data" if os.path.isdir("/data") else "/tmp", "stativersedb.db"),
     "live_db_path": os.path.join("/tmp", "stativersedb-live.db") if os.path.isdir("/data") else os.path.join("/tmp", "stativersedb.db"),
     "host": "0.0.0.0",
-    "port": int(os.environ.get("PORT", "7860"))
+    "port": int(os.environ.get("PORT", "7860")),
+    "workers": 2,
+    "torch_num_threads": 2,
+    "torch_num_interop_threads": 1
 }
 
 UNSET = object()
@@ -29,6 +45,24 @@ write_lock = threading.Lock()
 snapshot_state_lock = threading.Lock()
 last_snapshot_at = 0
 last_snapshot_error = None
+
+
+def configure_runtime() -> None:
+    try:
+        import torch
+    except Exception:
+        return
+    try:
+        torch.set_num_threads(CONFIG["torch_num_threads"])
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(CONFIG["torch_num_interop_threads"])
+    except Exception:
+        pass
+
+
+configure_runtime()
 
 app = FastAPI(title=CONFIG["app_name"], version="0.1.0")
 
@@ -563,6 +597,22 @@ def get_user(payload: dict) -> dict:
     return run_read(handler)
 
 
+def list_users(payload: dict) -> dict:
+    require_payload(payload)
+
+    def handler(conn: sqlite3.Connection):
+        rows = conn.execute(
+            """
+            SELECT user_id, username, max_size_bytes, used_size_bytes
+            FROM users
+            ORDER BY user_id ASC
+            """
+        ).fetchall()
+        return {"users": [serialize_user(row) for row in rows]}
+
+    return run_read(handler)
+
+
 def delete_user(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
 
@@ -871,6 +921,7 @@ def register_post(path: str, fn) -> None:
 register_post("/create_user", create_user)
 register_post("/edit_user", edit_user)
 register_post("/get_user", get_user)
+register_post("/list_users", list_users)
 register_post("/delete_user", delete_user)
 register_post("/create_project", create_project)
 register_post("/edit_project", edit_project)
@@ -887,4 +938,4 @@ register_post("/list", list_values)
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host=CONFIG["host"], port=CONFIG["port"])
+    uvicorn.run("app:app", host=CONFIG["host"], port=CONFIG["port"], workers=CONFIG["workers"])
