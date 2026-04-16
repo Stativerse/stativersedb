@@ -5,6 +5,7 @@ import threading
 import time
 import traceback
 
+from contextlib import contextmanager
 from typing import Any
 
 THREAD_ENV_VARS = (
@@ -25,6 +26,11 @@ import uvicorn
 from fastapi import Body, FastAPI
 from fastapi.responses import JSONResponse
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 CONFIG = {
     "app_name": "StativerseDB",
     "bucket_dir": "/data",
@@ -32,6 +38,7 @@ CONFIG = {
     "use_bucket": os.path.isdir("/data"),
     "snapshot_db_path": os.path.join("/data" if os.path.isdir("/data") else "/tmp", "stativersedb.db"),
     "live_db_path": os.path.join("/tmp", "stativersedb-live.db") if os.path.isdir("/data") else os.path.join("/tmp", "stativersedb.db"),
+    "startup_lock_path": os.path.join("/tmp", "stativersedb-startup.lock"),
     "host": "0.0.0.0",
     "port": int(os.environ.get("PORT", "7860")),
     "workers": 2,
@@ -42,6 +49,7 @@ CONFIG = {
 UNSET = object()
 
 write_lock = threading.Lock()
+startup_lock = threading.Lock()
 snapshot_state_lock = threading.Lock()
 last_snapshot_at = 0
 last_snapshot_error = None
@@ -198,6 +206,21 @@ def decode_value(value_json: str) -> Any:
     return json.loads(value_json)
 
 
+@contextmanager
+def startup_guard():
+    os.makedirs(os.path.dirname(CONFIG["startup_lock_path"]), exist_ok=True)
+    if fcntl is None:
+        with startup_lock:
+            yield
+        return
+    with open(CONFIG["startup_lock_path"], "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def open_connection(path: str, live: bool) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, cached_statements=256)
@@ -205,7 +228,6 @@ def open_connection(path: str, live: bool) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
     if live:
-        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA cache_size = -262144")
     return conn
@@ -267,6 +289,7 @@ def snapshot_live_db(source_conn: sqlite3.Connection | None = None) -> None:
 def init_db() -> None:
     conn = open_live_db()
     try:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -340,14 +363,16 @@ def migrate_db(conn: sqlite3.Connection) -> None:
 
 
 def initialize_storage() -> None:
-    restore_live_db()
-    init_db()
-    if CONFIG["use_bucket"] and not os.path.isfile(CONFIG["snapshot_db_path"]):
-        conn = open_live_db()
-        try:
-            snapshot_live_db(conn)
-        finally:
-            conn.close()
+    with startup_guard():
+        if not os.path.isfile(CONFIG["live_db_path"]):
+            restore_live_db()
+        init_db()
+        if CONFIG["use_bucket"] and not os.path.isfile(CONFIG["snapshot_db_path"]):
+            conn = open_live_db()
+            try:
+                snapshot_live_db(conn)
+            finally:
+                conn.close()
 
 
 def run_read(fn):
