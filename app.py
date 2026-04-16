@@ -5,12 +5,12 @@ import threading
 import time
 import traceback
 
-from functools import wraps
-from time import perf_counter
 from typing import Any
 
-import gradio
-import spaces
+import uvicorn
+
+from fastapi import Body, FastAPI
+from fastapi.responses import JSONResponse
 
 CONFIG = {
     "app_name": "StativerseDB",
@@ -19,89 +19,49 @@ CONFIG = {
     "use_bucket": os.path.isdir("/data"),
     "snapshot_db_path": os.path.join("/data" if os.path.isdir("/data") else "/tmp", "stativersedb.db"),
     "live_db_path": os.path.join("/tmp", "stativersedb-live.db") if os.path.isdir("/data") else os.path.join("/tmp", "stativersedb.db"),
-    "write_concurrency_id": "stativersedb-write",
-    "profile_timing": True
+    "host": "0.0.0.0",
+    "port": int(os.environ.get("PORT", "7860"))
 }
 
 UNSET = object()
 
 write_lock = threading.Lock()
 snapshot_state_lock = threading.Lock()
-request_profile_state = threading.local()
 last_snapshot_at = 0
 last_snapshot_error = None
 
+app = FastAPI(title=CONFIG["app_name"], version="0.1.0")
+
+
 class AppError(Exception):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, status_code: int = 400):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.status_code = status_code
 
-class RequestProfiler:
-    def __init__(self, name: str):
-        self.name = name
-        self.started_at = perf_counter()
-        self.last_step_at = self.started_at
-
-    def step(self, label: str) -> None:
-        if not CONFIG["profile_timing"]:
-            return
-        current = perf_counter()
-        delta_ms = (current - self.last_step_at) * 1000
-        total_ms = (current - self.started_at) * 1000
-        print(f"PROFILE | {self.name} | {label} | +{delta_ms:.2f} ms | total={total_ms:.2f} ms")
-        self.last_step_at = current
-
-    def finish(self, status: str) -> None:
-        if not CONFIG["profile_timing"]:
-            return
-        total_ms = (perf_counter() - self.started_at) * 1000
-        print(f"PROFILE | {self.name} | complete | status={status} | total={total_ms:.2f} ms")
-
-def set_request_profiler(profiler: RequestProfiler | None) -> None:
-    request_profile_state.profiler = profiler
-
-def get_request_profiler():
-    return getattr(request_profile_state, "profiler", None)
-
-def profile_step(label: str) -> None:
-    profiler = get_request_profiler()
-    if profiler:
-        profiler.step(label)
 
 def now_ts() -> int:
     return int(time.time())
 
+
 def ok_response(**payload) -> dict:
     return {"status": "ok", **payload}
+
 
 def error_response(code: str, message: str) -> dict:
     return {"status": "error", "error": {"code": code, "message": message}}
 
-def api_handler(fn):
-    @wraps(fn)
-    def wrapped(payload: dict | None = None) -> dict:
-        profiler = RequestProfiler(fn.__name__)
-        set_request_profiler(profiler)
-        try:
-            parsed_payload = require_payload(payload)
-            profile_step("payload parsed")
-            response = ok_response(**fn(parsed_payload))
-            profile_step("response built")
-            profiler.finish("ok")
-            return response
-        except AppError as exc:
-            profile_step(f"app error: {exc.code}")
-            profiler.finish(f"error:{exc.code}")
-            return error_response(exc.code, exc.message)
-        except Exception:
-            traceback.print_exc()
-            profile_step("internal error")
-            profiler.finish("error:internal")
-            return error_response("internal_error", "internal error")
-        finally:
-            set_request_profiler(None)
-    return wrapped
+
+def handle_route(fn, payload: dict | None = None):
+    try:
+        return ok_response(**fn(require_payload(payload)))
+    except AppError as exc:
+        return JSONResponse(status_code=exc.status_code, content=error_response(exc.code, exc.message))
+    except Exception:
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content=error_response("internal_error", "internal error"))
+
 
 def require_payload(payload: dict | None) -> dict:
     if payload is None:
@@ -110,14 +70,16 @@ def require_payload(payload: dict | None) -> dict:
         raise AppError("invalid_payload", "payload must be an object")
     return payload
 
+
 def require_name(payload: dict, field_name: str) -> str:
     value = payload.get(field_name)
     if not isinstance(value, str):
-        raise AppError("invalid_name", f"{field_name} must be a string")
+        raise AppError("invalid_name", f"{field_name} must be a string", 400)
     value = value.strip()
     if not value:
-        raise AppError("invalid_name", f"{field_name} cannot be empty")
+        raise AppError("invalid_name", f"{field_name} cannot be empty", 400)
     return value
+
 
 def optional_username(payload: dict):
     if "username" not in payload:
@@ -126,37 +88,41 @@ def optional_username(payload: dict):
     if value is None:
         return None
     if not isinstance(value, str):
-        raise AppError("invalid_username", "username must be a string or null")
+        raise AppError("invalid_username", "username must be a string or null", 400)
     value = value.strip()
     return value or None
 
+
 def parse_positive_int(value: Any, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise AppError("invalid_number", f"{field_name} must be a positive integer")
+        raise AppError("invalid_number", f"{field_name} must be a positive integer", 400)
     if value <= 0:
-        raise AppError("invalid_number", f"{field_name} must be a positive integer")
+        raise AppError("invalid_number", f"{field_name} must be a positive integer", 400)
     return value
+
 
 def require_positive_int(payload: dict, field_name: str) -> int:
     if field_name not in payload:
-        raise AppError("missing_field", f"{field_name} is required")
+        raise AppError("missing_field", f"{field_name} is required", 400)
     return parse_positive_int(payload[field_name], field_name)
+
 
 def optional_positive_int(payload: dict, field_name: str):
     if field_name not in payload:
         return UNSET
     return parse_positive_int(payload[field_name], field_name)
 
+
 def validate_json_value(value: Any) -> None:
     if value is None:
-        raise AppError("invalid_value", "value cannot be null")
+        raise AppError("invalid_value", "value cannot be null", 400)
     if isinstance(value, bool):
         return
     if isinstance(value, int):
         return
     if isinstance(value, float):
         if not (float("-inf") < value < float("inf")):
-            raise AppError("invalid_value", "value cannot contain NaN or Infinity")
+            raise AppError("invalid_value", "value cannot contain NaN or Infinity", 400)
         return
     if isinstance(value, str):
         return
@@ -167,10 +133,11 @@ def validate_json_value(value: Any) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             if not isinstance(key, str):
-                raise AppError("invalid_value", "object keys must be strings")
+                raise AppError("invalid_value", "object keys must be strings", 400)
             validate_json_value(item)
         return
-    raise AppError("invalid_value", "value must be a number, string, boolean, array, or object")
+    raise AppError("invalid_value", "value must be a number, string, boolean, array, or object", 400)
+
 
 def get_value_kind(value: Any) -> str:
     if isinstance(value, bool):
@@ -183,16 +150,19 @@ def get_value_kind(value: Any) -> str:
         return "array"
     return "object"
 
+
 def encode_value(value: Any) -> tuple[str, str]:
     validate_json_value(value)
     try:
         value_json = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except (TypeError, ValueError):
-        raise AppError("invalid_value", "value contains unsupported JSON data")
+        raise AppError("invalid_value", "value contains unsupported JSON data", 400)
     return value_json, get_value_kind(value)
+
 
 def decode_value(value_json: str) -> Any:
     return json.loads(value_json)
+
 
 def open_connection(path: str, live: bool) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -206,17 +176,21 @@ def open_connection(path: str, live: bool) -> sqlite3.Connection:
         conn.execute("PRAGMA cache_size = -262144")
     return conn
 
+
 def open_live_db() -> sqlite3.Connection:
     return open_connection(CONFIG["live_db_path"], live=True)
 
+
 def open_snapshot_db() -> sqlite3.Connection:
     return open_connection(CONFIG["snapshot_db_path"], live=False)
+
 
 def remove_live_files() -> None:
     for suffix in ("", "-wal", "-shm"):
         path = f"{CONFIG['live_db_path']}{suffix}"
         if os.path.exists(path):
             os.remove(path)
+
 
 def restore_live_db() -> None:
     if not CONFIG["use_bucket"] or not os.path.isfile(CONFIG["snapshot_db_path"]):
@@ -230,31 +204,31 @@ def restore_live_db() -> None:
         source.close()
         target.close()
 
+
 def set_snapshot_state(error: str | None) -> None:
     global last_snapshot_at, last_snapshot_error
     with snapshot_state_lock:
         last_snapshot_at = now_ts()
         last_snapshot_error = error
 
+
 def snapshot_live_db(source_conn: sqlite3.Connection | None = None) -> None:
     if not CONFIG["use_bucket"]:
         return
     target = open_snapshot_db()
-    profile_step("snapshot: open snapshot db")
     source = source_conn or open_live_db()
     close_source = source_conn is None
     try:
         source.backup(target)
-        profile_step("snapshot: backup complete")
         set_snapshot_state(None)
     except Exception as exc:
         print(f"SNAPSHOT | {exc}")
-        profile_step("snapshot: backup failed")
         set_snapshot_state(str(exc))
     finally:
         target.close()
         if close_source:
             source.close()
+
 
 def init_db() -> None:
     conn = open_live_db()
@@ -312,22 +286,24 @@ def init_db() -> None:
     finally:
         conn.close()
 
+
 def migrate_db(conn: sqlite3.Connection) -> None:
     user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
     if "used_size_bytes" not in user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN used_size_bytes INTEGER NOT NULL DEFAULT 0")
-    conn.execute(
-        """
-        UPDATE users
-        SET used_size_bytes = COALESCE((
-            SELECT SUM(length(CAST(k.value_json AS BLOB)))
-            FROM keys k
-            JOIN collections c ON c.id = k.collection_id
-            JOIN projects p ON p.id = c.project_id
-            WHERE p.user_id = users.id
-        ), 0)
-        """
-    )
+        conn.execute(
+            """
+            UPDATE users
+            SET used_size_bytes = COALESCE((
+                SELECT SUM(length(CAST(k.value_json AS BLOB)))
+                FROM keys k
+                JOIN collections c ON c.id = k.collection_id
+                JOIN projects p ON p.id = c.project_id
+                WHERE p.user_id = users.id
+            ), 0)
+            """
+        )
+
 
 def initialize_storage() -> None:
     restore_live_db()
@@ -339,45 +315,36 @@ def initialize_storage() -> None:
         finally:
             conn.close()
 
+
 def run_read(fn):
     conn = open_live_db()
-    profile_step("read: open db")
     try:
-        result = fn(conn)
-        profile_step("read: handler complete")
-        return result
+        return fn(conn)
     finally:
         conn.close()
-        profile_step("read: close db")
+
 
 def run_write(fn):
     with write_lock:
-        profile_step("write: lock acquired")
         conn = open_live_db()
-        profile_step("write: open db")
         try:
             conn.execute("BEGIN IMMEDIATE")
-            profile_step("write: begin immediate")
             result = fn(conn)
-            profile_step("write: handler complete")
             conn.execute("COMMIT")
-            profile_step("write: commit complete")
             snapshot_live_db(conn)
-            profile_step("write: snapshot complete")
             return result
         except Exception:
             try:
                 conn.execute("ROLLBACK")
-                profile_step("write: rollback complete")
             except sqlite3.Error:
                 pass
             raise
         finally:
             conn.close()
-            profile_step("write: close db")
+
 
 def get_user_row(conn: sqlite3.Connection, user_id: str):
-    row = conn.execute(
+    return conn.execute(
         """
         SELECT id, user_id, username, max_size_bytes, used_size_bytes, created_at, updated_at
         FROM users
@@ -385,50 +352,38 @@ def get_user_row(conn: sqlite3.Connection, user_id: str):
         """,
         (user_id,)
     ).fetchone()
-    profile_step("query: user row")
-    return row
+
 
 def get_user_by_username(conn: sqlite3.Connection, username: str, exclude_id: int | None = None):
     if exclude_id is None:
-        row = conn.execute(
-            "SELECT id FROM users WHERE username = ?",
-            (username,)
-        ).fetchone()
-        profile_step("query: username row")
-        return row
-    row = conn.execute(
-        "SELECT id FROM users WHERE username = ? AND id != ?",
-        (username, exclude_id)
-    ).fetchone()
-    profile_step("query: username row")
-    return row
+        return conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    return conn.execute("SELECT id FROM users WHERE username = ? AND id != ?", (username, exclude_id)).fetchone()
+
 
 def get_project_row(conn: sqlite3.Connection, user_row_id: int, project_name: str):
-    row = conn.execute(
+    return conn.execute(
         """
-        SELECT id, name, created_at, updated_at
+        SELECT id, name
         FROM projects
         WHERE user_id = ? AND name = ?
         """,
         (user_row_id, project_name)
     ).fetchone()
-    profile_step("query: project row")
-    return row
+
 
 def get_collection_row(conn: sqlite3.Connection, project_row_id: int, collection_name: str):
-    row = conn.execute(
+    return conn.execute(
         """
-        SELECT id, name, created_at, updated_at
+        SELECT id, name
         FROM collections
         WHERE project_id = ? AND name = ?
         """,
         (project_row_id, collection_name)
     ).fetchone()
-    profile_step("query: collection row")
-    return row
+
 
 def get_project_scope(conn: sqlite3.Connection, user_id: str, project_name: str):
-    row = conn.execute(
+    return conn.execute(
         """
         SELECT
             u.id AS user_row_id,
@@ -444,11 +399,10 @@ def get_project_scope(conn: sqlite3.Connection, user_id: str, project_name: str)
         """,
         (user_id, project_name)
     ).fetchone()
-    profile_step("query: project scope")
-    return row
+
 
 def get_collection_scope(conn: sqlite3.Connection, user_id: str, project_name: str, collection_name: str):
-    row = conn.execute(
+    return conn.execute(
         """
         SELECT
             u.id AS user_row_id,
@@ -467,33 +421,22 @@ def get_collection_scope(conn: sqlite3.Connection, user_id: str, project_name: s
         """,
         (user_id, project_name, collection_name)
     ).fetchone()
-    profile_step("query: collection scope")
-    return row
+
 
 def require_user_row(conn: sqlite3.Connection, user_id: str):
     row = get_user_row(conn, user_id)
     if not row:
-        raise AppError("user_not_found", "user not found")
+        raise AppError("user_not_found", "user not found", 404)
     return row
 
-def require_project_row(conn: sqlite3.Connection, user_row_id: int, project_name: str):
-    row = get_project_row(conn, user_row_id, project_name)
-    if not row:
-        raise AppError("project_not_found", "project not found")
-    return row
-
-def require_collection_row(conn: sqlite3.Connection, project_row_id: int, collection_name: str):
-    row = get_collection_row(conn, project_row_id, collection_name)
-    if not row:
-        raise AppError("collection_not_found", "collection not found")
-    return row
 
 def require_project_scope(conn: sqlite3.Connection, user_id: str, project_name: str):
     row = get_project_scope(conn, user_id, project_name)
     if row:
         return row
     require_user_row(conn, user_id)
-    raise AppError("project_not_found", "project not found")
+    raise AppError("project_not_found", "project not found", 404)
+
 
 def require_collection_scope(conn: sqlite3.Connection, user_id: str, project_name: str, collection_name: str):
     row = get_collection_scope(conn, user_id, project_name, collection_name)
@@ -501,9 +444,10 @@ def require_collection_scope(conn: sqlite3.Connection, user_id: str, project_nam
         return row
     project_scope = get_project_scope(conn, user_id, project_name)
     if project_scope:
-        raise AppError("collection_not_found", "collection not found")
+        raise AppError("collection_not_found", "collection not found", 404)
     require_user_row(conn, user_id)
-    raise AppError("project_not_found", "project not found")
+    raise AppError("project_not_found", "project not found", 404)
+
 
 def get_total_value_size_for_project(conn: sqlite3.Connection, project_row_id: int) -> int:
     row = conn.execute(
@@ -515,8 +459,8 @@ def get_total_value_size_for_project(conn: sqlite3.Connection, project_row_id: i
         """,
         (project_row_id,)
     ).fetchone()
-    profile_step("query: project total bytes")
     return int(row["total_size"] or 0)
+
 
 def get_total_value_size_for_collection(conn: sqlite3.Connection, collection_row_id: int) -> int:
     row = conn.execute(
@@ -527,15 +471,12 @@ def get_total_value_size_for_collection(conn: sqlite3.Connection, collection_row
         """,
         (collection_row_id,)
     ).fetchone()
-    profile_step("query: collection total bytes")
     return int(row["total_size"] or 0)
 
+
 def set_user_used_size_bytes(conn: sqlite3.Connection, user_row_id: int, used_size_bytes: int) -> None:
-    conn.execute(
-        "UPDATE users SET used_size_bytes = ? WHERE id = ?",
-        (used_size_bytes, user_row_id)
-    )
-    profile_step("write: user used_size_bytes")
+    conn.execute("UPDATE users SET used_size_bytes = ? WHERE id = ?", (max(used_size_bytes, 0), user_row_id))
+
 
 def serialize_user(row: sqlite3.Row) -> dict:
     return {
@@ -545,16 +486,15 @@ def serialize_user(row: sqlite3.Row) -> dict:
         "used_size_bytes": row["used_size_bytes"]
     }
 
+
 def serialize_project(row: sqlite3.Row) -> dict:
     return {"name": row["name"]}
+
 
 def serialize_collection(row: sqlite3.Row) -> dict:
     return {"name": row["name"]}
 
-def serialize_key(row: sqlite3.Row) -> dict:
-    return {"name": row["key_name"], "value": decode_value(row["value_json"])}
 
-@api_handler
 def create_user(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     username = optional_username(payload)
@@ -564,9 +504,9 @@ def create_user(payload: dict) -> dict:
 
     def handler(conn: sqlite3.Connection):
         if get_user_row(conn, user_id):
-            raise AppError("user_exists", "user already exists")
+            raise AppError("user_exists", "user already exists", 409)
         if username is not None and get_user_by_username(conn, username):
-            raise AppError("username_exists", "username already exists")
+            raise AppError("username_exists", "username already exists", 409)
         timestamp = now_ts()
         conn.execute(
             """
@@ -575,12 +515,11 @@ def create_user(payload: dict) -> dict:
             """,
             (user_id, username, max_size_bytes, 0, timestamp, timestamp)
         )
-        profile_step("write: create user")
         return {"user": {"user_id": user_id, "username": username, "max_size_bytes": max_size_bytes, "used_size_bytes": 0}}
 
     return run_write(handler)
 
-@api_handler
+
 def edit_user(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     username = optional_username(payload)
@@ -592,21 +531,17 @@ def edit_user(payload: dict) -> dict:
         values = []
         if username is not UNSET:
             if username is not None and get_user_by_username(conn, username, row["id"]):
-                raise AppError("username_exists", "username already exists")
+                raise AppError("username_exists", "username already exists", 409)
             updates.append("username = ?")
             values.append(username)
         if max_size_bytes is not UNSET:
             if max_size_bytes < row["used_size_bytes"]:
-                raise AppError("quota_too_small", f"max_size_bytes cannot be lower than current usage ({row['used_size_bytes']} bytes)")
+                raise AppError("quota_too_small", f"max_size_bytes cannot be lower than current usage ({row['used_size_bytes']} bytes)", 400)
             updates.append("max_size_bytes = ?")
             values.append(max_size_bytes)
         if updates:
             values.extend([now_ts(), user_id])
-            conn.execute(
-                f"UPDATE users SET {', '.join(updates)}, updated_at = ? WHERE user_id = ?",
-                values
-            )
-            profile_step("write: edit user")
+            conn.execute(f"UPDATE users SET {', '.join(updates)}, updated_at = ? WHERE user_id = ?", values)
         return {
             "user": {
                 "user_id": row["user_id"],
@@ -618,7 +553,7 @@ def edit_user(payload: dict) -> dict:
 
     return run_write(handler)
 
-@api_handler
+
 def get_user(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
 
@@ -627,19 +562,18 @@ def get_user(payload: dict) -> dict:
 
     return run_read(handler)
 
-@api_handler
+
 def delete_user(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
 
     def handler(conn: sqlite3.Connection):
         row = require_user_row(conn, user_id)
         conn.execute("DELETE FROM users WHERE id = ?", (row["id"],))
-        profile_step("write: delete user")
         return {"deleted": True}
 
     return run_write(handler)
 
-@api_handler
+
 def create_project(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
@@ -647,7 +581,7 @@ def create_project(payload: dict) -> dict:
     def handler(conn: sqlite3.Connection):
         user_row = require_user_row(conn, user_id)
         if get_project_row(conn, user_row["id"], project_name):
-            raise AppError("project_exists", "project already exists")
+            raise AppError("project_exists", "project already exists", 409)
         timestamp = now_ts()
         conn.execute(
             """
@@ -656,33 +590,30 @@ def create_project(payload: dict) -> dict:
             """,
             (user_row["id"], project_name, timestamp, timestamp)
         )
-        profile_step("write: create project")
         return {"project": {"name": project_name}}
 
     return run_write(handler)
 
-@api_handler
+
 def edit_project(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
     new_project_name = require_name(payload, "new_project_name")
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
-        if project_name != new_project_name and get_project_row(conn, user_row["id"], new_project_name):
-            raise AppError("project_exists", "project already exists")
+        project_scope = require_project_scope(conn, user_id, project_name)
+        if project_name != new_project_name and get_project_row(conn, project_scope["user_row_id"], new_project_name):
+            raise AppError("project_exists", "project already exists", 409)
         if project_name != new_project_name:
             conn.execute(
                 "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
-                (new_project_name, now_ts(), project_row["id"])
+                (new_project_name, now_ts(), project_scope["project_row_id"])
             )
-            profile_step("write: edit project")
         return {"project": {"name": new_project_name}}
 
     return run_write(handler)
 
-@api_handler
+
 def list_projects(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
 
@@ -697,12 +628,11 @@ def list_projects(payload: dict) -> dict:
             """,
             (user_row["id"],)
         ).fetchall()
-        profile_step("query: list projects")
         return {"projects": [serialize_project(row) for row in rows]}
 
     return run_read(handler)
 
-@api_handler
+
 def delete_project(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
@@ -711,14 +641,13 @@ def delete_project(payload: dict) -> dict:
         project_scope = require_project_scope(conn, user_id, project_name)
         deleted_bytes = get_total_value_size_for_project(conn, project_scope["project_row_id"])
         conn.execute("DELETE FROM projects WHERE id = ?", (project_scope["project_row_id"],))
-        profile_step("write: delete project")
         if deleted_bytes:
             set_user_used_size_bytes(conn, project_scope["user_row_id"], project_scope["used_size_bytes"] - deleted_bytes)
         return {"deleted": True}
 
     return run_write(handler)
 
-@api_handler
+
 def create_collection(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
@@ -727,7 +656,7 @@ def create_collection(payload: dict) -> dict:
     def handler(conn: sqlite3.Connection):
         project_scope = require_project_scope(conn, user_id, project_name)
         if get_collection_row(conn, project_scope["project_row_id"], collection_name):
-            raise AppError("collection_exists", "collection already exists")
+            raise AppError("collection_exists", "collection already exists", 409)
         timestamp = now_ts()
         conn.execute(
             """
@@ -736,12 +665,11 @@ def create_collection(payload: dict) -> dict:
             """,
             (project_scope["project_row_id"], collection_name, timestamp, timestamp)
         )
-        profile_step("write: create collection")
         return {"collection": {"name": collection_name}}
 
     return run_write(handler)
 
-@api_handler
+
 def edit_collection(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
@@ -751,18 +679,17 @@ def edit_collection(payload: dict) -> dict:
     def handler(conn: sqlite3.Connection):
         collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
         if collection_name != new_collection_name and get_collection_row(conn, collection_scope["project_row_id"], new_collection_name):
-            raise AppError("collection_exists", "collection already exists")
+            raise AppError("collection_exists", "collection already exists", 409)
         if collection_name != new_collection_name:
             conn.execute(
                 "UPDATE collections SET name = ?, updated_at = ? WHERE id = ?",
                 (new_collection_name, now_ts(), collection_scope["collection_row_id"])
             )
-            profile_step("write: edit collection")
         return {"collection": {"name": new_collection_name}}
 
     return run_write(handler)
 
-@api_handler
+
 def list_collections(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
@@ -778,12 +705,11 @@ def list_collections(payload: dict) -> dict:
             """,
             (project_scope["project_row_id"],)
         ).fetchall()
-        profile_step("query: list collections")
         return {"collections": [serialize_collection(row) for row in rows]}
 
     return run_read(handler)
 
-@api_handler
+
 def delete_collection(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
@@ -793,21 +719,20 @@ def delete_collection(payload: dict) -> dict:
         collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
         deleted_bytes = get_total_value_size_for_collection(conn, collection_scope["collection_row_id"])
         conn.execute("DELETE FROM collections WHERE id = ?", (collection_scope["collection_row_id"],))
-        profile_step("write: delete collection")
         if deleted_bytes:
             set_user_used_size_bytes(conn, collection_scope["user_row_id"], collection_scope["used_size_bytes"] - deleted_bytes)
         return {"deleted": True}
 
     return run_write(handler)
 
-@api_handler
+
 def set_value(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
     collection_name = require_name(payload, "collection_name")
     key_name = require_name(payload, "key_name")
     if "value" not in payload:
-        raise AppError("missing_field", "value is required")
+        raise AppError("missing_field", "value is required", 400)
     value_json, value_kind = encode_value(payload["value"])
     value_size = len(value_json.encode("utf-8"))
 
@@ -821,10 +746,9 @@ def set_value(payload: dict) -> dict:
             """,
             (collection_scope["collection_row_id"], key_name)
         ).fetchone()
-        profile_step("query: existing key")
         next_size_bytes = collection_scope["used_size_bytes"] - (int(existing["value_size"]) if existing else 0) + value_size
         if next_size_bytes > collection_scope["max_size_bytes"]:
-            raise AppError("quota_exceeded", f"user data exceeds max_size_bytes ({collection_scope['max_size_bytes']} bytes)")
+            raise AppError("quota_exceeded", f"user data exceeds max_size_bytes ({collection_scope['max_size_bytes']} bytes)", 400)
         timestamp = now_ts()
         conn.execute(
             """
@@ -838,13 +762,12 @@ def set_value(payload: dict) -> dict:
             """,
             (collection_scope["collection_row_id"], key_name, value_json, value_kind, timestamp, timestamp)
         )
-        profile_step("write: set value")
         set_user_used_size_bytes(conn, collection_scope["user_row_id"], next_size_bytes)
         return {"created": existing is None, "key": {"name": key_name, "value": payload["value"]}}
 
     return run_write(handler)
 
-@api_handler
+
 def get_value(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
@@ -861,12 +784,11 @@ def get_value(payload: dict) -> dict:
             """,
             (collection_scope["collection_row_id"], key_name)
         ).fetchone()
-        profile_step("query: get value")
         return {"value": None if not row else decode_value(row["value_json"])}
 
     return run_read(handler)
 
-@api_handler
+
 def remove_value(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
@@ -879,17 +801,15 @@ def remove_value(payload: dict) -> dict:
             "SELECT id, length(CAST(value_json AS BLOB)) AS value_size FROM keys WHERE collection_id = ? AND key_name = ?",
             (collection_scope["collection_row_id"], key_name)
         ).fetchone()
-        profile_step("query: removable key")
         if not row:
             return {"removed": False}
         conn.execute("DELETE FROM keys WHERE id = ?", (row["id"],))
-        profile_step("write: remove value")
         set_user_used_size_bytes(conn, collection_scope["user_row_id"], collection_scope["used_size_bytes"] - int(row["value_size"]))
         return {"removed": True}
 
     return run_write(handler)
 
-@api_handler
+
 def list_values(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
@@ -906,19 +826,30 @@ def list_values(payload: dict) -> dict:
             """,
             (collection_scope["collection_row_id"],)
         ).fetchall()
-        profile_step("query: list values")
         return {"data": {row["key_name"]: decode_value(row["value_json"]) for row in rows}}
 
     return run_read(handler)
 
-def endpoint(payload: dict) -> dict:
-    return {"received": payload, "message": "Working", "status": "ok"}
 
-def ping() -> bool:
-    print("SERVER | Space has been pinged.")
-    return True
+@app.on_event("startup")
+def startup() -> None:
+    initialize_storage()
 
-def health() -> dict:
+
+@app.post("/endpoint")
+def endpoint_route(payload: dict | None = Body(default=None)):
+    parsed_payload = require_payload(payload)
+    return {"status": "ok", "received": parsed_payload, "message": "Working"}
+
+
+@app.get("/ping")
+def ping_route():
+    print("SERVER | Docker Space has been pinged.")
+    return {"status": "ok", "ping": True}
+
+
+@app.get("/health")
+def health_route():
     with snapshot_state_lock:
         return ok_response(
             app=CONFIG["app_name"],
@@ -929,39 +860,31 @@ def health() -> dict:
             last_snapshot_error=last_snapshot_error
         )
 
-@spaces.GPU
-def _(): return None
 
-def register_api(fn, api_name: str, write: bool = False, queue: bool = True) -> None:
-    kwargs = {"api_name": api_name, "queue": queue}
-    if write:
-        kwargs["concurrency_limit"] = 1
-        kwargs["concurrency_id"] = CONFIG["write_concurrency_id"]
-    gradio.api(fn, **kwargs)
+def register_post(path: str, fn) -> None:
+    def route(payload: dict | None = Body(default=None)):
+        return handle_route(fn, payload)
+    route.__name__ = f"{fn.__name__}_{path.strip('/').replace('/', '_')}_route"
+    app.add_api_route(path, route, methods=["POST"])
 
-initialize_storage()
 
-with gradio.Blocks(title=CONFIG["app_name"]) as demo:
-    register_api(endpoint, "endpoint")
-    register_api(ping, "ping", queue=False)
-    register_api(health, "health", queue=False)
-    register_api(create_user, "create_user", write=True)
-    register_api(edit_user, "edit_user", write=True)
-    register_api(get_user, "get_user")
-    register_api(delete_user, "delete_user", write=True)
-    register_api(create_project, "create_project", write=True)
-    register_api(edit_project, "edit_project", write=True)
-    register_api(list_projects, "list_projects")
-    register_api(delete_project, "delete_project", write=True)
-    register_api(create_collection, "create_collection", write=True)
-    register_api(edit_collection, "edit_collection", write=True)
-    register_api(list_collections, "list_collections")
-    register_api(delete_collection, "delete_collection", write=True)
-    register_api(set_value, "set", write=True)
-    register_api(get_value, "get")
-    register_api(remove_value, "remove", write=True)
-    register_api(list_values, "list")
+register_post("/create_user", create_user)
+register_post("/edit_user", edit_user)
+register_post("/get_user", get_user)
+register_post("/delete_user", delete_user)
+register_post("/create_project", create_project)
+register_post("/edit_project", edit_project)
+register_post("/list_projects", list_projects)
+register_post("/delete_project", delete_project)
+register_post("/create_collection", create_collection)
+register_post("/edit_collection", edit_collection)
+register_post("/list_collections", list_collections)
+register_post("/delete_collection", delete_collection)
+register_post("/set", set_value)
+register_post("/get", get_value)
+register_post("/remove", remove_value)
+register_post("/list", list_values)
 
-demo.queue(default_concurrency_limit=16, max_size=256)
 
-if os.environ.get("STATIVERSEDB_SKIP_LAUNCH") != "1": demo.launch(ssr_mode=False)
+if __name__ == "__main__":
+    uvicorn.run("app:app", host=CONFIG["host"], port=CONFIG["port"])
