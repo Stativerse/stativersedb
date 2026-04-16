@@ -4,7 +4,7 @@ import gradio as gr
 def test_api(payload: dict):
     return {"received": payload, "message": "Working", "status": "ok"}
 
-@spaces.GPU()
+@spaces.GPU
 def _(): return
 
 with gr.Blocks() as demo:
