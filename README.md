@@ -4,6 +4,6 @@ emoji: 💿
 colorFrom: blue
 colorTo: blue
 sdk: docker
-pinned: false
+pinned: true
 short_description: Managed by StativerseDB
 ---
