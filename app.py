@@ -148,7 +148,7 @@ def decode_value(value_json: str) -> Any:
 
 def open_connection(path: str, live: bool) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, cached_statements=256)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -215,6 +215,7 @@ def init_db() -> None:
                 user_id TEXT NOT NULL UNIQUE,
                 username TEXT UNIQUE,
                 max_size_bytes INTEGER NOT NULL,
+                used_size_bytes INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -256,8 +257,26 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_keys_collection_id ON keys(collection_id);
             """
         )
+        migrate_db(conn)
     finally:
         conn.close()
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "used_size_bytes" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN used_size_bytes INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        """
+        UPDATE users
+        SET used_size_bytes = COALESCE((
+            SELECT SUM(length(CAST(k.value_json AS BLOB)))
+            FROM keys k
+            JOIN collections c ON c.id = k.collection_id
+            JOIN projects p ON p.id = c.project_id
+            WHERE p.user_id = users.id
+        ), 0)
+        """
+    )
 
 def initialize_storage() -> None:
     restore_live_db()
@@ -297,7 +316,7 @@ def run_write(fn):
 def get_user_row(conn: sqlite3.Connection, user_id: str):
     return conn.execute(
         """
-        SELECT id, user_id, username, max_size_bytes, created_at, updated_at
+        SELECT id, user_id, username, max_size_bytes, used_size_bytes, created_at, updated_at
         FROM users
         WHERE user_id = ?
         """,
@@ -335,6 +354,45 @@ def get_collection_row(conn: sqlite3.Connection, project_row_id: int, collection
         (project_row_id, collection_name)
     ).fetchone()
 
+def get_project_scope(conn: sqlite3.Connection, user_id: str, project_name: str):
+    return conn.execute(
+        """
+        SELECT
+            u.id AS user_row_id,
+            u.user_id,
+            u.username,
+            u.max_size_bytes,
+            u.used_size_bytes,
+            p.id AS project_row_id,
+            p.name AS project_name
+        FROM users u
+        JOIN projects p ON p.user_id = u.id
+        WHERE u.user_id = ? AND p.name = ?
+        """,
+        (user_id, project_name)
+    ).fetchone()
+
+def get_collection_scope(conn: sqlite3.Connection, user_id: str, project_name: str, collection_name: str):
+    return conn.execute(
+        """
+        SELECT
+            u.id AS user_row_id,
+            u.user_id,
+            u.username,
+            u.max_size_bytes,
+            u.used_size_bytes,
+            p.id AS project_row_id,
+            p.name AS project_name,
+            c.id AS collection_row_id,
+            c.name AS collection_name
+        FROM users u
+        JOIN projects p ON p.user_id = u.id
+        JOIN collections c ON c.project_id = p.id
+        WHERE u.user_id = ? AND p.name = ? AND c.name = ?
+        """,
+        (user_id, project_name, collection_name)
+    ).fetchone()
+
 def require_user_row(conn: sqlite3.Connection, user_id: str):
     row = get_user_row(conn, user_id)
     if not row:
@@ -353,28 +411,59 @@ def require_collection_row(conn: sqlite3.Connection, project_row_id: int, collec
         raise AppError("collection_not_found", "collection not found")
     return row
 
-def get_user_usage_bytes(conn: sqlite3.Connection, user_row_id: int) -> int:
+def require_project_scope(conn: sqlite3.Connection, user_id: str, project_name: str):
+    row = get_project_scope(conn, user_id, project_name)
+    if row:
+        return row
+    require_user_row(conn, user_id)
+    raise AppError("project_not_found", "project not found")
+
+def require_collection_scope(conn: sqlite3.Connection, user_id: str, project_name: str, collection_name: str):
+    row = get_collection_scope(conn, user_id, project_name, collection_name)
+    if row:
+        return row
+    project_scope = get_project_scope(conn, user_id, project_name)
+    if project_scope:
+        raise AppError("collection_not_found", "collection not found")
+    require_user_row(conn, user_id)
+    raise AppError("project_not_found", "project not found")
+
+def get_total_value_size_for_project(conn: sqlite3.Connection, project_row_id: int) -> int:
     row = conn.execute(
         """
-        SELECT COALESCE(SUM(length(CAST(k.value_json AS BLOB))), 0) AS used_size_bytes
+        SELECT COALESCE(SUM(length(CAST(k.value_json AS BLOB))), 0) AS total_size
         FROM keys k
         JOIN collections c ON c.id = k.collection_id
-        JOIN projects p ON p.id = c.project_id
-        WHERE p.user_id = ?
+        WHERE c.project_id = ?
         """,
-        (user_row_id,)
+        (project_row_id,)
     ).fetchone()
-    return int(row["used_size_bytes"] or 0)
+    return int(row["total_size"] or 0)
+
+def get_total_value_size_for_collection(conn: sqlite3.Connection, collection_row_id: int) -> int:
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(length(CAST(value_json AS BLOB))), 0) AS total_size
+        FROM keys
+        WHERE collection_id = ?
+        """,
+        (collection_row_id,)
+    ).fetchone()
+    return int(row["total_size"] or 0)
+
+def set_user_used_size_bytes(conn: sqlite3.Connection, user_row_id: int, used_size_bytes: int) -> None:
+    conn.execute(
+        "UPDATE users SET used_size_bytes = ? WHERE id = ?",
+        (used_size_bytes, user_row_id)
+    )
 
 def serialize_user(row: sqlite3.Row) -> dict:
     return {
         "user_id": row["user_id"],
         "username": row["username"],
-        "max_size_bytes": row["max_size_bytes"]
+        "max_size_bytes": row["max_size_bytes"],
+        "used_size_bytes": row["used_size_bytes"]
     }
-
-def serialize_user_with_usage(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
-    return {**serialize_user(row), "used_size_bytes": get_user_usage_bytes(conn, row["id"])}
 
 def serialize_project(row: sqlite3.Row) -> dict:
     return {"name": row["name"]}
@@ -401,12 +490,12 @@ def create_user(payload: dict) -> dict:
         timestamp = now_ts()
         conn.execute(
             """
-            INSERT INTO users (user_id, username, max_size_bytes, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO users (user_id, username, max_size_bytes, used_size_bytes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (user_id, username, max_size_bytes, timestamp, timestamp)
+            (user_id, username, max_size_bytes, 0, timestamp, timestamp)
         )
-        return {"user": serialize_user_with_usage(conn, get_user_row(conn, user_id))}
+        return {"user": {"user_id": user_id, "username": username, "max_size_bytes": max_size_bytes, "used_size_bytes": 0}}
 
     return run_write(handler)
 
@@ -426,9 +515,8 @@ def edit_user(payload: dict) -> dict:
             updates.append("username = ?")
             values.append(username)
         if max_size_bytes is not UNSET:
-            used_size_bytes = get_user_usage_bytes(conn, row["id"])
-            if max_size_bytes < used_size_bytes:
-                raise AppError("quota_too_small", f"max_size_bytes cannot be lower than current usage ({used_size_bytes} bytes)")
+            if max_size_bytes < row["used_size_bytes"]:
+                raise AppError("quota_too_small", f"max_size_bytes cannot be lower than current usage ({row['used_size_bytes']} bytes)")
             updates.append("max_size_bytes = ?")
             values.append(max_size_bytes)
         if updates:
@@ -437,7 +525,14 @@ def edit_user(payload: dict) -> dict:
                 f"UPDATE users SET {', '.join(updates)}, updated_at = ? WHERE user_id = ?",
                 values
             )
-        return {"user": serialize_user_with_usage(conn, get_user_row(conn, user_id))}
+        return {
+            "user": {
+                "user_id": row["user_id"],
+                "username": row["username"] if username is UNSET else username,
+                "max_size_bytes": row["max_size_bytes"] if max_size_bytes is UNSET else max_size_bytes,
+                "used_size_bytes": row["used_size_bytes"]
+            }
+        }
 
     return run_write(handler)
 
@@ -446,7 +541,7 @@ def get_user(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
 
     def handler(conn: sqlite3.Connection):
-        return {"user": serialize_user_with_usage(conn, require_user_row(conn, user_id))}
+        return {"user": serialize_user(require_user_row(conn, user_id))}
 
     return run_read(handler)
 
@@ -478,7 +573,7 @@ def create_project(payload: dict) -> dict:
             """,
             (user_row["id"], project_name, timestamp, timestamp)
         )
-        return {"project": serialize_project(get_project_row(conn, user_row["id"], project_name))}
+        return {"project": {"name": project_name}}
 
     return run_write(handler)
 
@@ -498,7 +593,7 @@ def edit_project(payload: dict) -> dict:
                 "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
                 (new_project_name, now_ts(), project_row["id"])
             )
-        return {"project": serialize_project(get_project_row(conn, user_row["id"], new_project_name))}
+        return {"project": {"name": new_project_name}}
 
     return run_write(handler)
 
@@ -527,9 +622,11 @@ def delete_project(payload: dict) -> dict:
     project_name = require_name(payload, "project_name")
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
-        conn.execute("DELETE FROM projects WHERE id = ?", (project_row["id"],))
+        project_scope = require_project_scope(conn, user_id, project_name)
+        deleted_bytes = get_total_value_size_for_project(conn, project_scope["project_row_id"])
+        conn.execute("DELETE FROM projects WHERE id = ?", (project_scope["project_row_id"],))
+        if deleted_bytes:
+            set_user_used_size_bytes(conn, project_scope["user_row_id"], project_scope["used_size_bytes"] - deleted_bytes)
         return {"deleted": True}
 
     return run_write(handler)
@@ -541,9 +638,8 @@ def create_collection(payload: dict) -> dict:
     collection_name = require_name(payload, "collection_name")
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
-        if get_collection_row(conn, project_row["id"], collection_name):
+        project_scope = require_project_scope(conn, user_id, project_name)
+        if get_collection_row(conn, project_scope["project_row_id"], collection_name):
             raise AppError("collection_exists", "collection already exists")
         timestamp = now_ts()
         conn.execute(
@@ -551,9 +647,9 @@ def create_collection(payload: dict) -> dict:
             INSERT INTO collections (project_id, name, created_at, updated_at)
             VALUES (?, ?, ?, ?)
             """,
-            (project_row["id"], collection_name, timestamp, timestamp)
+            (project_scope["project_row_id"], collection_name, timestamp, timestamp)
         )
-        return {"collection": serialize_collection(get_collection_row(conn, project_row["id"], collection_name))}
+        return {"collection": {"name": collection_name}}
 
     return run_write(handler)
 
@@ -565,17 +661,15 @@ def edit_collection(payload: dict) -> dict:
     new_collection_name = require_name(payload, "new_collection_name")
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
-        collection_row = require_collection_row(conn, project_row["id"], collection_name)
-        if collection_name != new_collection_name and get_collection_row(conn, project_row["id"], new_collection_name):
+        collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
+        if collection_name != new_collection_name and get_collection_row(conn, collection_scope["project_row_id"], new_collection_name):
             raise AppError("collection_exists", "collection already exists")
         if collection_name != new_collection_name:
             conn.execute(
                 "UPDATE collections SET name = ?, updated_at = ? WHERE id = ?",
-                (new_collection_name, now_ts(), collection_row["id"])
+                (new_collection_name, now_ts(), collection_scope["collection_row_id"])
             )
-        return {"collection": serialize_collection(get_collection_row(conn, project_row["id"], new_collection_name))}
+        return {"collection": {"name": new_collection_name}}
 
     return run_write(handler)
 
@@ -585,8 +679,7 @@ def list_collections(payload: dict) -> dict:
     project_name = require_name(payload, "project_name")
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
+        project_scope = require_project_scope(conn, user_id, project_name)
         rows = conn.execute(
             """
             SELECT name
@@ -594,7 +687,7 @@ def list_collections(payload: dict) -> dict:
             WHERE project_id = ?
             ORDER BY name ASC
             """,
-            (project_row["id"],)
+            (project_scope["project_row_id"],)
         ).fetchall()
         return {"collections": [serialize_collection(row) for row in rows]}
 
@@ -607,10 +700,11 @@ def delete_collection(payload: dict) -> dict:
     collection_name = require_name(payload, "collection_name")
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
-        collection_row = require_collection_row(conn, project_row["id"], collection_name)
-        conn.execute("DELETE FROM collections WHERE id = ?", (collection_row["id"],))
+        collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
+        deleted_bytes = get_total_value_size_for_collection(conn, collection_scope["collection_row_id"])
+        conn.execute("DELETE FROM collections WHERE id = ?", (collection_scope["collection_row_id"],))
+        if deleted_bytes:
+            set_user_used_size_bytes(conn, collection_scope["user_row_id"], collection_scope["used_size_bytes"] - deleted_bytes)
         return {"deleted": True}
 
     return run_write(handler)
@@ -627,21 +721,18 @@ def set_value(payload: dict) -> dict:
     value_size = len(value_json.encode("utf-8"))
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
-        collection_row = require_collection_row(conn, project_row["id"], collection_name)
+        collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
         existing = conn.execute(
             """
             SELECT id, length(CAST(value_json AS BLOB)) AS value_size
             FROM keys
             WHERE collection_id = ? AND key_name = ?
             """,
-            (collection_row["id"], key_name)
+            (collection_scope["collection_row_id"], key_name)
         ).fetchone()
-        used_size_bytes = get_user_usage_bytes(conn, user_row["id"])
-        next_size_bytes = used_size_bytes - (int(existing["value_size"]) if existing else 0) + value_size
-        if next_size_bytes > user_row["max_size_bytes"]:
-            raise AppError("quota_exceeded", f"user data exceeds max_size_bytes ({user_row['max_size_bytes']} bytes)")
+        next_size_bytes = collection_scope["used_size_bytes"] - (int(existing["value_size"]) if existing else 0) + value_size
+        if next_size_bytes > collection_scope["max_size_bytes"]:
+            raise AppError("quota_exceeded", f"user data exceeds max_size_bytes ({collection_scope['max_size_bytes']} bytes)")
         timestamp = now_ts()
         conn.execute(
             """
@@ -653,17 +744,10 @@ def set_value(payload: dict) -> dict:
                 value_kind = excluded.value_kind,
                 updated_at = excluded.updated_at
             """,
-            (collection_row["id"], key_name, value_json, value_kind, timestamp, timestamp)
+            (collection_scope["collection_row_id"], key_name, value_json, value_kind, timestamp, timestamp)
         )
-        row = conn.execute(
-            """
-            SELECT key_name, value_json
-            FROM keys
-            WHERE collection_id = ? AND key_name = ?
-            """,
-            (collection_row["id"], key_name)
-        ).fetchone()
-        return {"created": existing is None, "key": serialize_key(row)}
+        set_user_used_size_bytes(conn, collection_scope["user_row_id"], next_size_bytes)
+        return {"created": existing is None, "key": {"name": key_name, "value": payload["value"]}}
 
     return run_write(handler)
 
@@ -675,16 +759,14 @@ def get_value(payload: dict) -> dict:
     key_name = require_name(payload, "key_name")
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
-        collection_row = require_collection_row(conn, project_row["id"], collection_name)
+        collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
         row = conn.execute(
             """
             SELECT value_json
             FROM keys
             WHERE collection_id = ? AND key_name = ?
             """,
-            (collection_row["id"], key_name)
+            (collection_scope["collection_row_id"], key_name)
         ).fetchone()
         return {"value": None if not row else decode_value(row["value_json"])}
 
@@ -698,16 +780,15 @@ def remove_value(payload: dict) -> dict:
     key_name = require_name(payload, "key_name")
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
-        collection_row = require_collection_row(conn, project_row["id"], collection_name)
+        collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
         row = conn.execute(
-            "SELECT id FROM keys WHERE collection_id = ? AND key_name = ?",
-            (collection_row["id"], key_name)
+            "SELECT id, length(CAST(value_json AS BLOB)) AS value_size FROM keys WHERE collection_id = ? AND key_name = ?",
+            (collection_scope["collection_row_id"], key_name)
         ).fetchone()
         if not row:
             return {"removed": False}
         conn.execute("DELETE FROM keys WHERE id = ?", (row["id"],))
+        set_user_used_size_bytes(conn, collection_scope["user_row_id"], collection_scope["used_size_bytes"] - int(row["value_size"]))
         return {"removed": True}
 
     return run_write(handler)
@@ -719,9 +800,7 @@ def list_values(payload: dict) -> dict:
     collection_name = require_name(payload, "collection_name")
 
     def handler(conn: sqlite3.Connection):
-        user_row = require_user_row(conn, user_id)
-        project_row = require_project_row(conn, user_row["id"], project_name)
-        collection_row = require_collection_row(conn, project_row["id"], collection_name)
+        collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
         rows = conn.execute(
             """
             SELECT key_name, value_json
@@ -729,7 +808,7 @@ def list_values(payload: dict) -> dict:
             WHERE collection_id = ?
             ORDER BY key_name ASC
             """,
-            (collection_row["id"],)
+            (collection_scope["collection_row_id"],)
         ).fetchall()
         return {"data": {row["key_name"]: decode_value(row["value_json"]) for row in rows}}
 
