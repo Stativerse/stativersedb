@@ -95,6 +95,10 @@ def error_response(code: str, message: str) -> dict:
     return {"status": "error", "error": {"code": code, "message": message}}
 
 
+def internal_error_response() -> dict:
+    return error_response("internal_error", "internal error")
+
+
 def handle_route(fn, payload: dict | None = None):
     try:
         return ok_response(**fn(require_payload(payload)))
@@ -102,7 +106,7 @@ def handle_route(fn, payload: dict | None = None):
         return JSONResponse(status_code=exc.status_code, content=error_response(exc.code, exc.message))
     except Exception:
         traceback.print_exc()
-        return JSONResponse(status_code=500, content=error_response("internal_error", "internal error"))
+        return JSONResponse(status_code=500, content=internal_error_response())
 
 
 def require_payload(payload: dict | None) -> dict:
@@ -906,6 +910,90 @@ def list_values(payload: dict) -> dict:
     return run_read(handler)
 
 
+def execute_batch_action(action: str, payload: dict | None) -> dict:
+    if action == "endpoint":
+        parsed_payload = require_payload(payload)
+        return ok_response(received=parsed_payload, message="Working")
+    if action == "ping":
+        print("SERVER | Docker Space has been pinged.")
+        return ok_response(ping=True)
+    if action == "health":
+        with snapshot_state_lock:
+            return ok_response(
+                app=CONFIG["app_name"],
+                bucket_enabled=CONFIG["use_bucket"],
+                live_db_path=CONFIG["live_db_path"],
+                snapshot_db_path=CONFIG["snapshot_db_path"],
+                last_snapshot_at=last_snapshot_at,
+                last_snapshot_error=last_snapshot_error
+            )
+    handler = BATCH_ACTIONS.get(action)
+    if handler is None:
+        return error_response("invalid_action", "unknown action")
+    try:
+        return ok_response(**handler(payload))
+    except AppError as exc:
+        return error_response(exc.code, exc.message)
+    except Exception:
+        traceback.print_exc()
+        return internal_error_response()
+
+
+def batch_route_handler(payload: dict | None) -> dict:
+    body = require_payload(payload)
+    requests = body.get("requests")
+    if not isinstance(requests, list) or not requests:
+        raise AppError("invalid_payload", "requests must be a non-empty array", 400)
+    continue_on_error = body.get("continue_on_error", True)
+    if not isinstance(continue_on_error, bool):
+        raise AppError("invalid_payload", "continue_on_error must be a boolean", 400)
+
+    results = []
+    stopped = False
+    for index, item in enumerate(requests):
+        if not isinstance(item, dict):
+            result = error_response("invalid_payload", "batch item must be an object")
+            results.append({"index": index, **result})
+            if not continue_on_error:
+                stopped = True
+                break
+            continue
+        action = item.get("action")
+        if not isinstance(action, str) or not action.strip():
+            result = error_response("invalid_action", "action must be a non-empty string")
+        else:
+            result = execute_batch_action(action.strip(), item.get("payload"))
+        item_result = {"index": index, "action": action, **result}
+        if "id" in item:
+            item_result["id"] = item["id"]
+        results.append(item_result)
+        if result["status"] == "error" and not continue_on_error:
+            stopped = True
+            break
+    return {"results": results, "stopped": stopped}
+
+
+BATCH_ACTIONS = {
+    "create_user": create_user,
+    "edit_user": edit_user,
+    "get_user": get_user,
+    "list_users": list_users,
+    "delete_user": delete_user,
+    "create_project": create_project,
+    "edit_project": edit_project,
+    "list_projects": list_projects,
+    "delete_project": delete_project,
+    "create_collection": create_collection,
+    "edit_collection": edit_collection,
+    "list_collections": list_collections,
+    "delete_collection": delete_collection,
+    "set": set_value,
+    "get": get_value,
+    "remove": remove_value,
+    "list": list_values
+}
+
+
 @app.on_event("startup")
 def startup() -> None:
     initialize_storage()
@@ -934,6 +1022,11 @@ def health_route():
             last_snapshot_at=last_snapshot_at,
             last_snapshot_error=last_snapshot_error
         )
+
+
+@app.post("/batch")
+def batch_route(payload: dict | None = Body(default=None)):
+    return handle_route(batch_route_handler, payload)
 
 
 def register_post(path: str, fn) -> None:
