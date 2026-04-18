@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sqlite3
@@ -23,6 +24,7 @@ for env_name in THREAD_ENV_VARS:
 
 import uvicorn
 
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from fastapi import Body, FastAPI
 from fastapi.responses import JSONResponse
 
@@ -37,13 +39,18 @@ CONFIG = {
     "tmp_dir": "/tmp",
     "use_bucket": os.path.isdir("/data"),
     "snapshot_db_path": os.path.join("/data" if os.path.isdir("/data") else "/tmp", "stativersedb.db"),
+    "encrypted_snapshot_path": os.path.join("/data", "stativersedb.db.enc"),
     "live_db_path": os.path.join("/tmp", "stativersedb-live.db") if os.path.isdir("/data") else os.path.join("/tmp", "stativersedb.db"),
     "startup_lock_path": os.path.join("/tmp", "stativersedb-startup.lock"),
+    "write_lock_path": os.path.join("/tmp", "stativersedb-write.lock"),
     "host": "0.0.0.0",
     "port": int(os.environ.get("PORT", "7860")),
     "workers": 2,
     "torch_num_threads": 2,
-    "torch_num_interop_threads": 1
+    "torch_num_interop_threads": 1,
+    "sqlite_cache_size_kib": 131072,
+    "encryption_chunk_bytes": 4 * 1024 * 1024,
+    "encryption_magic": b"SVDBENC1"
 }
 
 UNSET = object()
@@ -210,6 +217,41 @@ def decode_value(value_json: str) -> Any:
     return json.loads(value_json)
 
 
+def decode_secret_bytes(value: str) -> bytes:
+    padded = value + "=" * (-len(value) % 4)
+    candidates = []
+    if len(value.encode("utf-8")) == 32:
+        candidates.append(value.encode("utf-8"))
+    for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            decoded = decoder(padded)
+        except Exception:
+            continue
+        if len(decoded) == 32:
+            candidates.append(decoded)
+    try:
+        decoded = bytes.fromhex(value)
+    except ValueError:
+        decoded = None
+    if decoded and len(decoded) == 32:
+        candidates.append(decoded)
+    if candidates:
+        return candidates[0]
+    raise RuntimeError("STATIVERSEDB_ENCRYPTION_KEY must decode to exactly 32 bytes")
+
+
+def load_encryption_key() -> bytes | None:
+    if not CONFIG["use_bucket"]:
+        return None
+    raw_value = os.environ.get("STATIVERSEDB_ENCRYPTION_KEY", "").strip()
+    if not raw_value:
+        raise RuntimeError("STATIVERSEDB_ENCRYPTION_KEY is required when a bucket is attached")
+    return decode_secret_bytes(raw_value)
+
+
+ENCRYPTION_KEY = load_encryption_key()
+
+
 @contextmanager
 def startup_guard():
     os.makedirs(os.path.dirname(CONFIG["startup_lock_path"]), exist_ok=True)
@@ -225,6 +267,22 @@ def startup_guard():
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def write_guard():
+    os.makedirs(os.path.dirname(CONFIG["write_lock_path"]), exist_ok=True)
+    if fcntl is None:
+        with write_lock:
+            yield
+        return
+    with write_lock:
+        with open(CONFIG["write_lock_path"], "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def open_connection(path: str, live: bool) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, cached_statements=256)
@@ -233,7 +291,7 @@ def open_connection(path: str, live: bool) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 5000")
     if live:
         conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA cache_size = -262144")
+        conn.execute(f"PRAGMA cache_size = -{CONFIG['sqlite_cache_size_kib']}")
     return conn
 
 
@@ -245,6 +303,61 @@ def open_snapshot_db() -> sqlite3.Connection:
     return open_connection(CONFIG["snapshot_db_path"], live=False)
 
 
+def atomic_replace(source_path: str, target_path: str) -> None:
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    with open(source_path, "rb") as source_file:
+        os.fsync(source_file.fileno())
+    os.replace(source_path, target_path)
+
+
+def encrypt_file(source_path: str, target_path: str) -> None:
+    temp_target_path = f"{target_path}.tmp"
+    nonce = os.urandom(12)
+    encryptor = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.GCM(nonce)).encryptor()
+    with open(source_path, "rb") as source_file, open(temp_target_path, "wb") as target_file:
+        target_file.write(CONFIG["encryption_magic"])
+        target_file.write(nonce)
+        while True:
+            chunk = source_file.read(CONFIG["encryption_chunk_bytes"])
+            if not chunk:
+                break
+            target_file.write(encryptor.update(chunk))
+        encryptor.finalize()
+        target_file.write(encryptor.tag)
+        target_file.flush()
+        os.fsync(target_file.fileno())
+    atomic_replace(temp_target_path, target_path)
+
+
+def decrypt_file(source_path: str, target_path: str) -> None:
+    temp_target_path = f"{target_path}.tmp"
+    source_size = os.path.getsize(source_path)
+    header_size = len(CONFIG["encryption_magic"]) + 12 + 16
+    if source_size <= header_size:
+        raise RuntimeError("encrypted snapshot is invalid")
+    with open(source_path, "rb") as source_file:
+        if source_file.read(len(CONFIG["encryption_magic"])) != CONFIG["encryption_magic"]:
+            raise RuntimeError("encrypted snapshot header is invalid")
+        nonce = source_file.read(12)
+        ciphertext_size = source_size - len(CONFIG["encryption_magic"]) - 12 - 16
+        source_file.seek(source_size - 16)
+        tag = source_file.read(16)
+        source_file.seek(len(CONFIG["encryption_magic"]) + 12)
+        decryptor = Cipher(algorithms.AES(ENCRYPTION_KEY), modes.GCM(nonce, tag)).decryptor()
+        remaining = ciphertext_size
+        with open(temp_target_path, "wb") as target_file:
+            while remaining > 0:
+                chunk = source_file.read(min(CONFIG["encryption_chunk_bytes"], remaining))
+                if not chunk:
+                    raise RuntimeError("encrypted snapshot payload is truncated")
+                target_file.write(decryptor.update(chunk))
+                remaining -= len(chunk)
+            decryptor.finalize()
+            target_file.flush()
+            os.fsync(target_file.fileno())
+    atomic_replace(temp_target_path, target_path)
+
+
 def remove_live_files() -> None:
     for suffix in ("", "-wal", "-shm"):
         path = f"{CONFIG['live_db_path']}{suffix}"
@@ -253,7 +366,13 @@ def remove_live_files() -> None:
 
 
 def restore_live_db() -> None:
-    if not CONFIG["use_bucket"] or not os.path.isfile(CONFIG["snapshot_db_path"]):
+    if not CONFIG["use_bucket"]:
+        return
+    if os.path.isfile(CONFIG["encrypted_snapshot_path"]):
+        remove_live_files()
+        decrypt_file(CONFIG["encrypted_snapshot_path"], CONFIG["live_db_path"])
+        return
+    if not os.path.isfile(CONFIG["snapshot_db_path"]):
         return
     remove_live_files()
     source = open_snapshot_db()
@@ -275,17 +394,20 @@ def set_snapshot_state(error: str | None) -> None:
 def snapshot_live_db(source_conn: sqlite3.Connection | None = None) -> None:
     if not CONFIG["use_bucket"]:
         return
-    target = open_snapshot_db()
     source = source_conn or open_live_db()
     close_source = source_conn is None
     try:
-        source.backup(target)
+        checkpoint_row = source.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+        if checkpoint_row and int(checkpoint_row[0]) != 0:
+            raise RuntimeError("wal checkpoint did not complete before bucket snapshot")
+        encrypt_file(CONFIG["live_db_path"], CONFIG["encrypted_snapshot_path"])
+        if os.path.isfile(CONFIG["snapshot_db_path"]):
+            os.remove(CONFIG["snapshot_db_path"])
         set_snapshot_state(None)
     except Exception as exc:
         print(f"SNAPSHOT | {exc}")
         set_snapshot_state(str(exc))
     finally:
-        target.close()
         if close_source:
             source.close()
 
@@ -371,7 +493,7 @@ def initialize_storage() -> None:
         if not os.path.isfile(CONFIG["live_db_path"]):
             restore_live_db()
         init_db()
-        if CONFIG["use_bucket"] and not os.path.isfile(CONFIG["snapshot_db_path"]):
+        if CONFIG["use_bucket"] and not os.path.isfile(CONFIG["encrypted_snapshot_path"]):
             conn = open_live_db()
             try:
                 snapshot_live_db(conn)
@@ -388,7 +510,7 @@ def run_read(fn):
 
 
 def run_write(fn):
-    with write_lock:
+    with write_guard():
         conn = open_live_db()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -922,8 +1044,9 @@ def execute_batch_action(action: str, payload: dict | None) -> dict:
             return ok_response(
                 app=CONFIG["app_name"],
                 bucket_enabled=CONFIG["use_bucket"],
+                bucket_encryption_enabled=CONFIG["use_bucket"],
                 live_db_path=CONFIG["live_db_path"],
-                snapshot_db_path=CONFIG["snapshot_db_path"],
+                snapshot_db_path=CONFIG["encrypted_snapshot_path"] if CONFIG["use_bucket"] else CONFIG["snapshot_db_path"],
                 last_snapshot_at=last_snapshot_at,
                 last_snapshot_error=last_snapshot_error
             )
@@ -1017,8 +1140,9 @@ def health_route():
         return ok_response(
             app=CONFIG["app_name"],
             bucket_enabled=CONFIG["use_bucket"],
+            bucket_encryption_enabled=CONFIG["use_bucket"],
             live_db_path=CONFIG["live_db_path"],
-            snapshot_db_path=CONFIG["snapshot_db_path"],
+            snapshot_db_path=CONFIG["encrypted_snapshot_path"] if CONFIG["use_bucket"] else CONFIG["snapshot_db_path"],
             last_snapshot_at=last_snapshot_at,
             last_snapshot_error=last_snapshot_error
         )
