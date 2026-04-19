@@ -730,8 +730,6 @@ def edit_user(payload: dict) -> dict:
             updates.append("username = ?")
             values.append(username)
         if max_size_bytes is not UNSET:
-            if max_size_bytes < row["used_size_bytes"]:
-                raise AppError("quota_too_small", f"max_size_bytes cannot be lower than current usage ({row['used_size_bytes']} bytes)", 400)
             updates.append("max_size_bytes = ?")
             values.append(max_size_bytes)
         if updates:
