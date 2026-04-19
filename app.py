@@ -54,6 +54,9 @@ CONFIG = {
 }
 
 UNSET = object()
+MAX_KEY_NAME_CHARS = 128
+MAX_VALUE_BYTES = 1024
+MAX_LIST_LIMIT = 100
 
 write_lock = threading.Lock()
 startup_lock = threading.Lock()
@@ -131,6 +134,13 @@ def require_name(payload: dict, field_name: str) -> str:
     value = value.strip()
     if not value:
         raise AppError("invalid_name", f"{field_name} cannot be empty", 400)
+    return value
+
+
+def require_key_name(payload: dict, field_name: str = "key_name") -> str:
+    value = require_name(payload, field_name)
+    if len(value) > MAX_KEY_NAME_CHARS:
+        raise AppError("invalid_name", f"{field_name} must be at most {MAX_KEY_NAME_CHARS} characters", 400)
     return value
 
 
@@ -931,11 +941,13 @@ def set_value(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
     collection_name = require_name(payload, "collection_name")
-    key_name = require_name(payload, "key_name")
+    key_name = require_key_name(payload, "key_name")
     if "value" not in payload:
         raise AppError("missing_field", "value is required", 400)
     value_json, value_kind = encode_value(payload["value"])
     value_size = len(value_json.encode("utf-8"))
+    if value_size > MAX_VALUE_BYTES:
+        raise AppError("value_too_large", f"value must be at most {MAX_VALUE_BYTES} bytes", 400)
 
     def handler(conn: sqlite3.Connection):
         collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
@@ -973,7 +985,7 @@ def get_value(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
     collection_name = require_name(payload, "collection_name")
-    key_name = require_name(payload, "key_name")
+    key_name = require_key_name(payload, "key_name")
 
     def handler(conn: sqlite3.Connection):
         collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
@@ -994,7 +1006,7 @@ def remove_value(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
     collection_name = require_name(payload, "collection_name")
-    key_name = require_name(payload, "key_name")
+    key_name = require_key_name(payload, "key_name")
 
     def handler(conn: sqlite3.Connection):
         collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
@@ -1015,19 +1027,47 @@ def list_values(payload: dict) -> dict:
     user_id = require_name(payload, "user_id")
     project_name = require_name(payload, "project_name")
     collection_name = require_name(payload, "collection_name")
+    cursor = payload.get("cursor")
+    if cursor is not None:
+        if not isinstance(cursor, str):
+            raise AppError("invalid_name", "cursor must be a string", 400)
+        cursor = cursor.strip() or None
+    limit = optional_positive_int(payload, "limit")
+    if limit is UNSET:
+        limit = None
+    elif limit > MAX_LIST_LIMIT:
+        raise AppError("invalid_number", f"limit must be at most {MAX_LIST_LIMIT}", 400)
 
     def handler(conn: sqlite3.Connection):
         collection_scope = require_collection_scope(conn, user_id, project_name, collection_name)
-        rows = conn.execute(
-            """
+        params: list[Any] = [collection_scope["collection_row_id"]]
+        where_after = ""
+        if cursor is not None:
+            where_after = "AND key_name > ?"
+            params.append(cursor)
+        query = f"""
             SELECT key_name, value_json
             FROM keys
             WHERE collection_id = ?
+            {where_after}
             ORDER BY key_name ASC
-            """,
-            (collection_scope["collection_row_id"],)
-        ).fetchall()
-        return {"data": {row["key_name"]: decode_value(row["value_json"]) for row in rows}}
+        """
+        if limit is not None:
+            query += "\n            LIMIT ?"
+            params.append(limit + 1)
+        rows = conn.execute(query, tuple(params)).fetchall()
+        has_more = limit is not None and len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        items = [{"key": row["key_name"], "value": decode_value(row["value_json"])} for row in rows]
+        next_cursor = items[-1]["key"] if has_more and items else None
+        return {
+            "data": {item["key"]: item["value"] for item in items},
+            "items": items,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "limit": limit
+        }
 
     return run_read(handler)
 
