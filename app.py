@@ -247,15 +247,15 @@ def decode_secret_bytes(value: str) -> bytes:
         candidates.append(decoded)
     if candidates:
         return candidates[0]
-    raise RuntimeError("STATIVERSEDB_ENCRYPTION_KEY must decode to exactly 32 bytes")
+    raise RuntimeError("ENCRYPTION_KEY must decode to exactly 32 bytes")
 
 
 def load_encryption_key() -> bytes | None:
     if not CONFIG["use_bucket"]:
         return None
-    raw_value = os.environ.get("STATIVERSEDB_ENCRYPTION_KEY", "").strip()
+    raw_value = os.environ.get("ENCRYPTION_KEY", "").strip()
     if not raw_value:
-        raise RuntimeError("STATIVERSEDB_ENCRYPTION_KEY is required when a bucket is attached")
+        raise RuntimeError("ENCRYPTION_KEY is required when a bucket is attached")
     return decode_secret_bytes(raw_value)
 
 
